@@ -1,0 +1,125 @@
+###############################################################################
+# Default EC2NodeClass — AWS-specific node provisioning details.
+#
+# An EC2NodeClass is the AWS provider counterpart to a NodePool: it tells
+# Karpenter which AMI family, security groups, subnets, IAM role, block
+# devices, and user-data to use when launching nodes. One EC2NodeClass can
+# be referenced by multiple NodePools.
+#
+# Replace `eks-platform-baseline` below with the actual cluster name if
+# different. The discovery selectors rely on the eks module having tagged
+# its private subnets and cluster security group with
+# `karpenter.sh/discovery = <cluster_name>`.
+###############################################################################
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: default
+  labels:
+    app.kubernetes.io/managed-by: terraform
+spec:
+  # AMI family — Bottlerocket is the recommended choice for new clusters:
+  # immutable root filesystem, atomic updates, smaller attack surface.
+  # Switch to AL2023 if you need broader package compatibility.
+  amiFamily: Bottlerocket
+
+  # AMI selectors — use the latest published Bottlerocket image for the
+  # cluster's K8s minor version. Karpenter watches the SSM parameter and
+  # rolls nodes when a new AMI is published (subject to Drift budget).
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+
+  # IAM — Karpenter wraps this role into an instance profile during launch.
+  # Must match the worker-node role from the eks module.
+  role: "eks-platform-baseline-node"
+
+  # Discover subnets and security groups by tag. The eks module tags its
+  # private subnets with `karpenter.sh/discovery = <cluster_name>`. Add the
+  # tag manually to any extra subnets / SGs you want eligible.
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: eks-platform-baseline
+
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: eks-platform-baseline
+
+  # Tag every node Karpenter launches so cost-allocation reports can
+  # attribute capacity to this cluster.
+  tags:
+    karpenter.sh/discovery: eks-platform-baseline
+    Cluster: eks-platform-baseline
+    ManagedBy: karpenter
+    NodeType: stateless
+
+  # Block device mappings.
+  #
+  # Bottlerocket uses two volumes:
+  #   /dev/xvda -> 4 GiB OS volume (small, immutable)
+  #   /dev/xvdb -> data volume holding /var, /etc, container images
+  #
+  # We size the data volume at 100 GiB on gp3 with explicit IOPS so node
+  # behaviour is consistent across instance shapes (gp3 baseline IOPS
+  # otherwise scale with size, leading to surprises).
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 4Gi
+        volumeType: gp3
+        encrypted: true
+        deleteOnTermination: true
+
+    - deviceName: /dev/xvdb
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        iops: 3000
+        throughput: 125
+        encrypted: true
+        deleteOnTermination: true
+
+  # Metadata service — IMDSv2 only, hop limit 1 (containers can't reach it
+  # by default — narrows IAM-token theft via SSRF).
+  metadataOptions:
+    httpEndpoint: enabled
+    httpProtocolIPv6: disabled
+    httpPutResponseHopLimit: 1
+    httpTokens: required
+
+  # Detailed CloudWatch monitoring — provides 1-minute granularity metrics
+  # to drive Karpenter's pricing decisions and alerting dashboards.
+  detailedMonitoring: false
+
+  # Nodes are placed in private subnets only; no public IPs.
+  associatePublicIPAddress: false
+
+  # User-data — Bottlerocket TOML. We bump kernel-level limits (file
+  # descriptors, TCP backlog) so heavy-IO pods don't get throttled at the
+  # kernel boundary, and we enable the kernel `lockdown` setting in
+  # integrity mode to block unsigned kernel module loads.
+  userData: |
+    [settings.kernel]
+    lockdown = "integrity"
+
+    [settings.kernel.sysctl]
+    "net.core.somaxconn" = "4096"
+    "net.ipv4.tcp_max_syn_backlog" = "4096"
+    "fs.file-max" = "1000000"
+
+    [settings.kubernetes]
+    cluster-name = "eks-platform-baseline"
+    # Reserve resources for system daemons. Without these reservations a
+    # spike in pod usage can starve kubelet itself.
+    [settings.kubernetes.system-reserved]
+    cpu = "100m"
+    memory = "200Mi"
+    ephemeral-storage = "1Gi"
+
+    [settings.kubernetes.kube-reserved]
+    cpu = "100m"
+    memory = "300Mi"
+    ephemeral-storage = "1Gi"
+
+    [settings.kubernetes.eviction-hard]
+    "memory.available" = "100Mi"
+    "nodefs.available" = "10%"

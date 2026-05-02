@@ -1,0 +1,139 @@
+###############################################################################
+# Default NodePool — Spot-first stateless workloads.
+#
+# A NodePool defines *what* nodes Karpenter is allowed to launch and *when*
+# it should consolidate them away. This is the catch-all NodePool for
+# stateless application pods. Stateful workloads (databases, caches with
+# local volumes) should land on a separate NodePool with `spot = false` and
+# `disruption.consolidationPolicy = WhenEmpty`.
+#
+# Apply order:
+#   1. terraform apply  (creates CRDs + controller)
+#   2. kubectl apply -f manifests/karpenter/ec2-nodeclass.yaml
+#   3. kubectl apply -f manifests/karpenter/nodepool.yaml
+###############################################################################
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: default
+  labels:
+    app.kubernetes.io/managed-by: terraform
+    karpenter.sh/discovery: eks-platform-baseline
+  annotations:
+    description: >-
+      Default Spot-first NodePool for stateless workloads. Falls back to
+      on-demand capacity when Spot is unavailable. Consolidates aggressively
+      when nodes are underutilised.
+spec:
+  # The template is the PodSpec-style description of nodes Karpenter will
+  # provision. Labels here propagate to every node (and therefore every pod
+  # scheduled on them via downward API).
+  template:
+    metadata:
+      labels:
+        workload: stateless
+        provisioner: karpenter
+    spec:
+      # nodeClassRef points at the EC2NodeClass — the AWS-specific bits
+      # (AMI family, security groups, block device mappings).
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: default
+
+      # Taints — pods must explicitly tolerate `workload=stateless` to land
+      # here. Stops daemonsets / system addons from accidentally consuming
+      # spot capacity.
+      taints:
+        - key: workload
+          value: stateless
+          effect: NoSchedule
+
+      # Requirements drive the instance-type selection. The constraints are
+      # ANDed; within a single key, multiple values are ORed. Karpenter
+      # picks the *cheapest* type that satisfies pending pod resource
+      # requests.
+      requirements:
+        # Architectures we tolerate. arm64 (Graviton) is preferred for cost
+        # but pods that aren't multi-arch fall back to amd64 automatically.
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64", "arm64"]
+
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+
+        # Capacity types — ordering doesn't imply preference here; Karpenter
+        # always tries Spot first when both are listed because it's cheaper.
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["spot", "on-demand"]
+
+        # Restrict to general-purpose + compute-optimised families. Excludes
+        # GPU, memory-optimised, burstable (t3*), and metal — those need a
+        # dedicated NodePool with explicit selection.
+        - key: karpenter.k8s.aws/instance-category
+          operator: In
+          values: ["c", "m", "r"]
+
+        # CPU bound — keep nodes between 2 and 32 vCPUs. Smaller wastes
+        # daemonset overhead; bigger creates large blast radius on
+        # interruption.
+        - key: karpenter.k8s.aws/instance-cpu
+          operator: In
+          values: ["2", "4", "8", "16", "32"]
+
+        # Memory floor — avoid nano/micro shapes that can't fit even small
+        # JVM workloads.
+        - key: karpenter.k8s.aws/instance-memory
+          operator: Gt
+          values: ["3000"]
+
+        # Generation floor — m5/c5/r5 and newer. Older families are slower
+        # and not cost-competitive on a per-vCPU basis.
+        - key: karpenter.k8s.aws/instance-generation
+          operator: Gt
+          values: ["4"]
+
+      # Maximum lifetime: nodes are recycled after 7 days even if healthy.
+      # Forces regular AMI patching without manual intervention.
+      expireAfter: 168h
+
+      # When set, Karpenter waits this long after a node becomes "empty"
+      # (no non-daemonset pods) before terminating it. 30s is a reasonable
+      # default; raise to 5m for stateful nodepools.
+      terminationGracePeriod: 60s
+
+  # Consolidation policy: rebalance to fewer/smaller nodes whenever
+  # possible. WhenEmptyOrUnderutilized considers a node for replacement if
+  # all its pods could fit on cheaper alternatives — even if the node has
+  # pods on it.
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 1m
+
+    # Budgets cap how many nodes Karpenter can disrupt simultaneously.
+    # During business hours we throttle to 10% to limit blast radius;
+    # off-hours we allow up to 30% of fleet to roll at once.
+    budgets:
+      - nodes: "10%"
+        reasons: ["Underutilized", "Empty"]
+        # Mon-Fri 09:00-18:00 in IST (cron uses cluster TZ; assumed UTC by
+        # default — adjust schedule for your timezone).
+        schedule: "0 3 * * mon-fri"
+        duration: 9h
+      - nodes: "30%"
+      - nodes: "0"
+        reasons: ["Drifted"]
+        schedule: "0 3 * * mon-fri"
+        duration: 9h
+
+  # Hard caps. Combined with the cluster autoscaler limits, this prevents
+  # a runaway pending pod from launching unbounded capacity.
+  limits:
+    cpu: "1000"
+    memory: "4000Gi"
+
+  # weight ranks NodePools when multiple match a pod. Higher = preferred.
+  weight: 10

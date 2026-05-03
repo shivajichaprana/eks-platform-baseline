@@ -1,0 +1,218 @@
+###############################################################################
+# Reference Ingress — exercises ALB Controller + ExternalDNS + cert-manager.
+#
+# When applied this manifest:
+#
+#   1. ALB Controller spins up an internet-facing Application Load Balancer
+#      with an HTTP→HTTPS redirect listener (443 → ACM cert below).
+#   2. cert-manager issues a Let's Encrypt prod certificate for `host:`
+#      using the Route 53 DNS-01 solver. The Secret it produces is
+#      consumed by the ALB via the `tls:` block.
+#   3. ExternalDNS observes the Ingress, picks up the LB DNS name, and
+#      creates an ALIAS A record pointing `host:` at the ALB.
+#
+# All three controllers must be running before applying this manifest.
+#
+# Replace the placeholders before kubectl apply:
+#   * <APP_HOSTNAME>   — fully-qualified DNS name (e.g. demo.example.com)
+#   * <CERT_NAME>      — k8s name for the Certificate resource (any string)
+###############################################################################
+
+# A tiny upstream — nginx serving the default page so the Ingress has
+# something to point at end-to-end.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ingress-demo
+  labels:
+    app.kubernetes.io/part-of: eks-platform-baseline
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello
+  namespace: ingress-demo
+  labels:
+    app.kubernetes.io/name: hello
+    app.kubernetes.io/component: demo-upstream
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: hello
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: hello
+    spec:
+      # Spread the two replicas across nodes for HA. ALB Controller treats
+      # readiness gates as authoritative, so a NotReady pod is never sent
+      # traffic — but anti-affinity makes the gates' job easier.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: hello
+      containers:
+        - name: nginx
+          image: public.ecr.aws/nginx/nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+              name: http
+          # Resource requests + limits are mandatory for any workload that
+          # ships in this repo.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false # nginx writes its PID file
+            runAsNonRoot: false           # base nginx image runs as root in master
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: hello
+  namespace: ingress-demo
+  labels:
+    app.kubernetes.io/name: hello
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: hello
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+
+---
+
+# Optional explicit Certificate. cert-manager can also auto-create one from
+# the Ingress annotation alone, but spelling it out makes troubleshooting
+# easier and lets you reuse the cert across multiple Ingresses.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: <CERT_NAME>
+  namespace: ingress-demo
+  labels:
+    app.kubernetes.io/part-of: eks-platform-baseline
+spec:
+  secretName: <CERT_NAME>-tls
+  duration: 2160h    # 90 days — Let's Encrypt's max
+  renewBefore: 720h  # 30 days before expiry
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+  dnsNames:
+    - <APP_HOSTNAME>
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+
+---
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: hello
+  namespace: ingress-demo
+  labels:
+    app.kubernetes.io/name: hello
+    app.kubernetes.io/part-of: eks-platform-baseline
+  annotations:
+    # ----- ALB Controller annotations -----
+    # internet-facing ALB; flip to "internal" for a private VPC ALB.
+    alb.ingress.kubernetes.io/scheme: internet-facing
+
+    # IP target type — required when running on Fargate or with the VPC CNI
+    # in prefix-delegation mode. Use "instance" only on classic node
+    # configurations.
+    alb.ingress.kubernetes.io/target-type: ip
+
+    # Listen on both 80 and 443; redirect 80 → 443.
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: '443'
+
+    # Modern TLS policy — reject TLS < 1.2.
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+    # ALB-level access logs to S3. Comment out if no audit bucket is set.
+    # alb.ingress.kubernetes.io/load-balancer-attributes:
+    #   access_logs.s3.enabled=true,access_logs.s3.bucket=<LOG_BUCKET>,access_logs.s3.prefix=hello
+
+    # Health-check route used by ALB target group; must return 200.
+    alb.ingress.kubernetes.io/healthcheck-path: /
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: '15'
+    alb.ingress.kubernetes.io/success-codes: '200'
+
+    # Use the Pod-readiness gate so rolling deployments don't dump traffic
+    # into a target group before its targets are healthy.
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+
+    # ----- cert-manager annotation -----
+    # Tell cert-manager which ClusterIssuer to use. cert-manager will create
+    # a Certificate object on the fly if `Certificate` above were omitted,
+    # but having both is harmless.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+    # ----- ExternalDNS annotations -----
+    # Optional — defaults to the Ingress `host:` if omitted. Setting it
+    # explicitly is more robust against host-rule edits.
+    external-dns.alpha.kubernetes.io/hostname: <APP_HOSTNAME>
+
+    # Default TTL of 60s — short enough for fast cutovers, long enough to
+    # avoid flooding Route 53 with caches.
+    external-dns.alpha.kubernetes.io/ttl: '60'
+spec:
+  ingressClassName: alb
+  tls:
+    # The Secret here matches `Certificate.secretName` above. cert-manager
+    # populates the Secret; the ALB Controller picks it up and re-uses
+    # the underlying ACM-imported cert.
+    - hosts:
+        - <APP_HOSTNAME>
+      secretName: <CERT_NAME>-tls
+  rules:
+    - host: <APP_HOSTNAME>
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: hello
+                port:
+                  number: 80

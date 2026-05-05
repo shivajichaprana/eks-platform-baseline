@@ -1,0 +1,113 @@
+# Terraform CI for eks-platform-baseline.
+#
+# Runs on every PR and push to main. Validates formatting, syntax, lints
+# with tflint, and security-scans with checkov. Requires no AWS credentials —
+# it does NOT run `terraform plan` against a real backend.
+name: terraform-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-ci.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.9.5"
+  TFLINT_VERSION: "v0.53.0"
+
+concurrency:
+  group: terraform-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----- 1. fmt + validate -------------------------------------------------
+  fmt-validate:
+    name: fmt + validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt -check -recursive
+        run: terraform fmt -check -recursive terraform
+
+      - name: terraform init (no backend)
+        working-directory: terraform
+        run: terraform init -backend=false -input=false
+
+      - name: terraform validate
+        working-directory: terraform
+        run: terraform validate -no-color
+
+  # ----- 2. tflint --------------------------------------------------------
+  tflint:
+    name: tflint
+    runs-on: ubuntu-latest
+    needs: fmt-validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - name: Cache tflint plugin dir
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        with:
+          path: ~/.tflint.d/plugins
+          key: tflint-${{ runner.os }}-${{ hashFiles('.tflint.hcl') }}
+
+      - name: Setup tflint
+        uses: terraform-linters/setup-tflint@19a0ddb6b46ab6f8a2c7c9b2efbc12fdd4756354 # v4.0.0
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: tflint --init
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: tflint
+        run: tflint --recursive --config "$(pwd)/.tflint.hcl" --format compact
+
+  # ----- 3. checkov -------------------------------------------------------
+  checkov:
+    name: checkov
+    runs-on: ubuntu-latest
+    needs: fmt-validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - name: Run checkov
+        uses: bridgecrewio/checkov-action@38a95e98d734de90b74687a0fc94cfb4dcc9c169 # v12.2845.0
+        with:
+          directory: terraform
+          framework: terraform
+          quiet: true
+          soft_fail: false
+          output_format: cli,sarif
+          output_file_path: console,checkov.sarif
+          download_external_modules: false
+          skip_check: CKV_AWS_111,CKV_AWS_109
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@4dd16135b69a43b6c8efb853346f8437d92d3c93 # v3.26.6
+        with:
+          sarif_file: checkov.sarif
+          category: checkov

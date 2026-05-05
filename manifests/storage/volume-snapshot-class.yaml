@@ -1,0 +1,59 @@
+###############################################################################
+# VolumeSnapshotClass for the EBS CSI driver.
+#
+# The CSI external-snapshotter sidecar (bundled in the EBS CSI managed
+# addon) creates EBS snapshots when a VolumeSnapshot resource is created.
+# A VolumeSnapshotClass tells the snapshotter which driver to use and how
+# to handle the snapshot lifecycle.
+#
+# Use case examples:
+#
+#   * App-level backup tooling (Velero, Kasten K10) drives this to take
+#     point-in-time EBS snapshots before backing up.
+#   * Application "fork" workflows: snapshot prod volume → mount the
+#     snapshot in a staging environment for safe testing.
+#
+# `deletionPolicy: Retain` — when a VolumeSnapshot is deleted, the
+# underlying EBS snapshot is KEPT (not deleted). For backup workflows
+# that's almost always what you want — you don't want a stray
+# `kubectl delete volumesnapshot` to silently nuke your only restore
+# point. Switch to `Delete` for ephemeral / dev clusters.
+###############################################################################
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ebs-csi-snapshot
+  annotations:
+    snapshot.storage.kubernetes.io/is-default-class: "true"
+  labels:
+    app.kubernetes.io/name: ebs-csi-snapshot
+    app.kubernetes.io/part-of: eks-platform-baseline
+    app.kubernetes.io/managed-by: kubectl
+driver: ebs.csi.aws.com
+deletionPolicy: Retain
+parameters:
+  # Tags applied to the underlying EBS snapshot — show up in the AWS
+  # console, billing reports, and EventBridge events.
+  tagSpecification_1: "kubernetes.io/cluster/eks-platform-baseline=owned"
+  tagSpecification_2: "managed-by=ebs-csi"
+---
+###############################################################################
+# Aggressive-cleanup variant for dev/staging clusters.
+#
+# Pin to this with `volumeSnapshotClassName: ebs-csi-snapshot-delete` if
+# you want EBS snapshots actually removed when their VolumeSnapshot is
+# deleted. Useful in CI ephemeral environments to control snapshot
+# storage cost.
+###############################################################################
+apiVersion: snapshot.storage.k8s.io/v1
+kind: VolumeSnapshotClass
+metadata:
+  name: ebs-csi-snapshot-delete
+  labels:
+    app.kubernetes.io/name: ebs-csi-snapshot-delete
+    app.kubernetes.io/part-of: eks-platform-baseline
+    app.kubernetes.io/managed-by: kubectl
+driver: ebs.csi.aws.com
+deletionPolicy: Delete
+parameters:
+  tagSpecification_1: "managed-by=ebs-csi"

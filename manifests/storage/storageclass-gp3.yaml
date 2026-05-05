@@ -1,0 +1,80 @@
+###############################################################################
+# Reference gp3 StorageClass.
+#
+# The cluster's default gp3 StorageClass is created by the
+# `terraform/modules/ebs-csi` module (so it lives in Terraform state).
+# This file is a portable, kubectl-applyable copy intended for:
+#
+#   * Bringing up a fresh cluster end-to-end via the bootstrap script before
+#     `terraform apply` has run the kubernetes provider step.
+#   * Documentation: this is what the StorageClass shape looks like.
+#   * Disaster recovery: re-create the SC quickly without spinning Terraform.
+#
+# If both this manifest and the Terraform-managed SC are present, the
+# Terraform-managed one wins on subsequent applies. Pick one in production.
+#
+# Key choices baked in here, mirroring the Terraform module:
+#
+#   * gp3 — uniform performance regardless of size, configurable IOPS and
+#     throughput, same baseline price as gp2 with better defaults.
+#   * `volumeBindingMode: WaitForFirstConsumer` — the EBS volume is
+#     provisioned in the same AZ as the pod that ends up scheduling.
+#     This avoids the classic "PV stuck in AZ A, pod can only schedule
+#     in AZ B" deadlock with topology spread constraints / Karpenter.
+#   * `allowVolumeExpansion: true` — `kubectl patch pvc ...` to grow online.
+#   * `encrypted: "true"` — turns on EBS encryption. Without `kmsKeyId` it
+#     uses the AWS-managed `aws/ebs` key. Override at apply time with
+#     `--from-literal=kmsKeyId=arn:aws:kms:...` if you want a CMK.
+#   * `is-default-class: "true"` — PVCs that omit `storageClassName` land
+#     here. Keep exactly one default per cluster.
+###############################################################################
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+  labels:
+    app.kubernetes.io/name: gp3
+    app.kubernetes.io/part-of: eks-platform-baseline
+    app.kubernetes.io/managed-by: kubectl
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Delete
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  iops: "3000"
+  throughput: "125"
+  encrypted: "true"
+  csi.storage.k8s.io/fstype: ext4
+  # To use a customer-managed KMS key, uncomment and set the ARN. The EBS
+  # CSI controller IRSA role must include kms:CreateGrant on this key.
+  #
+  # kmsKeyId: arn:aws:kms:eu-west-1:123456789012:key/abcd-1234-...
+---
+###############################################################################
+# Higher-IOPS variant, NOT default.
+#
+# Pin to this with `storageClassName: gp3-high-iops` on the PVC for
+# IO-heavy workloads (e.g. PostgreSQL primary, Elasticsearch data nodes).
+# 16000 IOPS / 1000 MiB/s is the gp3 ceiling — beyond that step up to io2.
+###############################################################################
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3-high-iops
+  labels:
+    app.kubernetes.io/name: gp3-high-iops
+    app.kubernetes.io/part-of: eks-platform-baseline
+    app.kubernetes.io/managed-by: kubectl
+provisioner: ebs.csi.aws.com
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+volumeBindingMode: WaitForFirstConsumer
+parameters:
+  type: gp3
+  iops: "16000"
+  throughput: "1000"
+  encrypted: "true"
+  csi.storage.k8s.io/fstype: xfs

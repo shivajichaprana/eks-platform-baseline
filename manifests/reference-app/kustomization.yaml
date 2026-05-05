@@ -1,0 +1,17 @@
+# Kustomization that bundles the reference-app manifests so an operator
+# can deploy the whole stack with a single `kubectl apply -k`.
+---
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: reference-app
+
+commonLabels:
+  app.kubernetes.io/part-of: eks-platform-baseline
+
+resources:
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - pdb.yaml

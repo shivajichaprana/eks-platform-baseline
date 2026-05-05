@@ -1,0 +1,20 @@
+# PodDisruptionBudget for the reference application.
+#
+# Karpenter, cluster autoscaler, and node upgrades all respect PDBs.
+# minAvailable: 2 means we can lose at most 1 of the 3 baseline replicas
+# during a voluntary disruption (drain, pod eviction, etc.).
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: reference-app
+  namespace: reference-app
+  labels:
+    app.kubernetes.io/name: reference-app
+    app.kubernetes.io/part-of: eks-platform-baseline
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reference-app
+  unhealthyPodEvictionPolicy: AlwaysAllow

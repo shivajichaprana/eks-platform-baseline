@@ -1,0 +1,211 @@
+# Reference application deployment.
+#
+# Demonstrates production-grade pod configuration on the eks-platform-baseline:
+#   * Resource requests AND limits (so HPA + Karpenter can size correctly)
+#   * Liveness, readiness, and startup probes
+#   * Pod-level securityContext with runAsNonRoot
+#   * Topology spread constraints across nodes (zone-aware)
+#   * Anti-affinity to keep replicas off the same node
+#   * Karpenter-friendly node selector (default NodePool)
+#
+# Image: public nginx:1.27-alpine. Real workloads should pull from ECR.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: reference-app
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: reference-app
+  namespace: reference-app
+automountServiceAccountToken: false
+---
+# Minimal nginx config that exposes /healthz, /ready and / on port 8080.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: reference-app-nginx
+  namespace: reference-app
+data:
+  default.conf: |
+    server {
+      listen 8080 default_server;
+      server_name _;
+      access_log /dev/stdout;
+      error_log /dev/stderr;
+
+      location = /healthz {
+        access_log off;
+        return 200 "ok\n";
+        add_header Content-Type text/plain;
+      }
+
+      location = /ready {
+        access_log off;
+        return 200 "ready\n";
+        add_header Content-Type text/plain;
+      }
+
+      location / {
+        return 200 "reference-app on $hostname\n";
+        add_header Content-Type text/plain;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: reference-app
+  namespace: reference-app
+  labels:
+    app.kubernetes.io/name: reference-app
+    app.kubernetes.io/part-of: eks-platform-baseline
+    app.kubernetes.io/managed-by: kubectl
+spec:
+  replicas: 3
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: reference-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: reference-app
+        app.kubernetes.io/part-of: eks-platform-baseline
+    spec:
+      serviceAccountName: reference-app
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      # Prefer Karpenter-provisioned nodes from the default NodePool.
+      nodeSelector:
+        karpenter.sh/nodepool: default
+      tolerations:
+        - key: workload
+          operator: Equal
+          value: stateless
+          effect: NoSchedule
+      # Spread pods across zones AND nodes.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: reference-app
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: reference-app
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: reference-app
+      containers:
+        - name: nginx
+          image: public.ecr.aws/nginx/nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+              ephemeral-storage: 100Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+              ephemeral-storage: 1Gi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 30
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                # Allow the load balancer to deregister us before we shut down.
+                command: ["/bin/sh", "-c", "sleep 10"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+      volumes:
+        - name: nginx-conf
+          configMap:
+            name: reference-app-nginx
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: nginx-cache
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: nginx-run
+          emptyDir:
+            sizeLimit: 8Mi

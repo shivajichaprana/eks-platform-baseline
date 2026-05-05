@@ -1,0 +1,25 @@
+# Cluster-IP service for the reference application.
+#
+# Targets the deployment's port 8080 by name ("http"). The ALB Ingress
+# created in ingress.yaml resolves backends via this service.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reference-app
+  namespace: reference-app
+  labels:
+    app.kubernetes.io/name: reference-app
+    app.kubernetes.io/part-of: eks-platform-baseline
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: reference-app
+  # Distribute traffic uniformly. PreferClose can be enabled later for
+  # zone-aware routing once topology hints are tuned.
+  internalTrafficPolicy: Cluster

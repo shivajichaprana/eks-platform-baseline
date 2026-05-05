@@ -1,0 +1,55 @@
+# HorizontalPodAutoscaler for the reference application.
+#
+# Requires metrics-server, which was provisioned in Day 40. We scale on
+# both CPU AND memory to demonstrate multi-metric HPA. Behavior tuning
+# (stabilization windows, policies) is set explicitly so scale events
+# do not flap.
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: reference-app
+  namespace: reference-app
+  labels:
+    app.kubernetes.io/name: reference-app
+    app.kubernetes.io/part-of: eks-platform-baseline
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: reference-app
+  minReplicas: 3
+  maxReplicas: 30
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 75
+  behavior:
+    scaleUp:
+      # React quickly to load: double pods every 30s, capped at +4 pods.
+      stabilizationWindowSeconds: 30
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 100
+          periodSeconds: 30
+        - type: Pods
+          value: 4
+          periodSeconds: 30
+    scaleDown:
+      # Be conservative: only shed 25% of pods every 60s after a 5min hold.
+      stabilizationWindowSeconds: 300
+      selectPolicy: Max
+      policies:
+        - type: Percent
+          value: 25
+          periodSeconds: 60
